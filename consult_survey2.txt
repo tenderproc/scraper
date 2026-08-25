@@ -1,0 +1,4 @@
+total consultation rows: 48
+regex hits (consultation des ... suivant[es] :): 2
+('wallonia_deliberations', 'https://www.deliberations.be/gembloux/decisions/03-mars-2026-19-00/foyer-communal-fourniture-et-pose-dune-cuisine-professionnelle-et-dune-cuisine-de-rechauffe-modification-du-cahier-des-charges-ratification-approbation', 'consultation des entreprises suivantes :')
+('wallonia_deliberations', 'https://www.deliberations.be/ham-sur-heure-nalinnes/decisions/09-juillet-2026-19-00/marche-public-de-service-financier-de-financement-par-emprunts', 'consultation des établissements de crédits suivants :')
