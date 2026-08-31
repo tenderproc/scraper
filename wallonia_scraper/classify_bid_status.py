@@ -78,6 +78,32 @@ _CLOSED_SHORTLIST_CONSULTATION_RE = re.compile(
 
 _EMPTY_DESCRIPTION_PLACEHOLDER = "geef korte beschrijving op"
 
+# wallonia_conseilcommunal-only: a title like "Fixation des conditions et
+# mode de passation d'un marché de travaux (Procédure ouverte)" names the
+# award METHOD the council picked, not that bidding is open today - it's the
+# same pre-tender "approving specs and procedure" administrative step this
+# whole project has repeatedly found to be non-actionable (see the Kortenberg
+# mandating-Herent case, the Walhain deadline-required fix). Verified live
+# 2026-08-31 by comparing against the identical title pattern in
+# wallonia_deliberations, which DOES have a full description: given only the
+# title, the LLM tier over-trusts "procédure ouverte" as a positive signal
+# and flips to open_call (7 of the first 15 recovered rows were exactly this
+# pattern with no further signal); given the full description for the same
+# pattern, the same model correctly returns not_biddable - once because the
+# extra prose stated no concrete deadline/publication mandate, once because a
+# LATER decision (invisible from the title) had cancelled the tender for lack
+# of funding. Title alone can't surface either of those, so default to
+# not_biddable on this pattern rather than let the LLM guess from a title
+# that structurally can't support the distinction.
+_AMBIGUOUS_APPROVAL_RE = re.compile(r"conditions?.{0,40}(?:mode|passation)|passation.{0,40}conditions?", re.IGNORECASE)
+# ...unless a stronger, explicit call-type phrase is ALSO present - those
+# name an actual invitation/announcement rather than just the chosen method,
+# so it's worth letting the LLM weigh in rather than blanket-suppressing.
+_STRONGER_CALL_SIGNAL_RE = re.compile(
+    r"adjudication publique|appels? [aà] manifestation d[’']int[ée]r[êe]t|mise en concurrence|appel d[’']offres|avis de march[ée]",
+    re.IGNORECASE,
+)
+
 
 def _fold(text: str) -> str:
     return unicodedata.normalize("NFKC", text or "").lower()
@@ -88,7 +114,7 @@ def _has_no_real_description(description: str | None) -> bool:
     return len(stripped) == 0 or _fold(stripped) == _EMPTY_DESCRIPTION_PLACEHOLDER.replace(" ", "")
 
 
-def marker_verdict(description: str | None, source: str | None = None) -> str | None:
+def marker_verdict(description: str | None, source: str | None = None, title: str | None = None) -> str | None:
     """Returns 'not_biddable' if a verified marker matches, else None
     (needs the LLM tier). Never returns 'open_call' — no marker here is a
     positive signal, only a confidently-negative one; see the product
@@ -115,6 +141,10 @@ def marker_verdict(description: str | None, source: str | None = None) -> str | 
     # real content.
     if source != "wallonia_conseilcommunal" and _has_no_real_description(desc):
         return "not_biddable"
+    if source == "wallonia_conseilcommunal":
+        title_text = title or ""
+        if not _STRONGER_CALL_SIGNAL_RE.search(title_text) and _AMBIGUOUS_APPROVAL_RE.search(title_text):
+            return "not_biddable"
     return None
 
 
@@ -133,6 +163,19 @@ Answer with exactly one JSON object, no other text:
 
 Default to "not_biddable" over "open_call" when genuinely torn — these records are council minutes, not tender notices, so the bar for "open_call" is a record that itself describes an active, ongoing public competition, not just "procurement is happening somewhere in this process"."""
 
+# Appended only when the record has no description (wallonia_conseilcommunal -
+# see marker_verdict's docstring). Verified live 2026-08-31: given a title
+# alone, this model over-trusts "procédure ouverte" (naming the award METHOD
+# a council picked) as if it meant bidding is open today, in cases where the
+# same model reading the full description for an identical title pattern
+# correctly said not_biddable - once for lack of any concrete deadline/
+# publication statement, once because a later decision (only visible in the
+# fuller record) had cancelled the tender. A title can't rule either of those
+# out, so raise the bar accordingly.
+_TITLE_ONLY_ADDENDUM = """
+
+IMPORTANT: this record has no description — you are working from the title alone, with no way to check for a stated deadline, a publication mandate, or a later decision that changed the outcome. Do NOT treat "procédure ouverte" / "openbare procedure" by itself as evidence of an active call — that phrase only names which award method the council chose, and by itself is exactly as ambiguous as "approving the budget estimate". Only answer "open_call" if the title itself names an actual invitation or announcement event (e.g. "adjudication publique", "appel à manifestation d'intérêt", "mise en concurrence", "appel d'offres", "avis de marché"), not just the chosen procedure type. Otherwise default to "not_biddable"."""
+
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=20))
 def _classify_with_llm(title: str, description: str) -> tuple[str, str]:
@@ -142,6 +185,7 @@ def _classify_with_llm(title: str, description: str) -> tuple[str, str]:
     # truncate rather than let one outlier record blow the request up —
     # the classification-relevant content is consistently near the start.
     body_text = f"Title: {title}\n\nDescription: {(description or '')[:4000]}"
+    system_prompt = _SYSTEM_PROMPT + (_TITLE_ONLY_ADDENDUM if not description else "")
     resp = requests.post(
         ANTHROPIC_URL,
         headers={
@@ -152,7 +196,7 @@ def _classify_with_llm(title: str, description: str) -> tuple[str, str]:
         json={
             "model": ANTHROPIC_MODEL,
             "max_tokens": 150,
-            "system": _SYSTEM_PROMPT,
+            "system": system_prompt,
             "messages": [{"role": "user", "content": body_text}],
         },
         timeout=30,
@@ -247,7 +291,7 @@ def run() -> None:
 
     counts = {"marker/not_biddable": 0, "llm/open_call": 0, "llm/not_biddable": 0, "llm/unclear": 0, "llm/failed": 0}
     for i, row in enumerate(rows):
-        verdict = marker_verdict(row.get("description"), row.get("source"))
+        verdict = marker_verdict(row.get("description"), row.get("source"), row.get("title"))
         if verdict is not None:
             _update_bid_status(session, row["source"], row["source_reference"], verdict, "matched a known non-biddable marker", "marker")
             counts["marker/not_biddable"] += 1
