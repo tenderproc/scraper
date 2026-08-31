@@ -88,7 +88,7 @@ def _has_no_real_description(description: str | None) -> bool:
     return len(stripped) == 0 or _fold(stripped) == _EMPTY_DESCRIPTION_PLACEHOLDER.replace(" ", "")
 
 
-def marker_verdict(description: str | None) -> str | None:
+def marker_verdict(description: str | None, source: str | None = None) -> str | None:
     """Returns 'not_biddable' if a verified marker matches, else None
     (needs the LLM tier). Never returns 'open_call' — no marker here is a
     positive signal, only a confidently-negative one; see the product
@@ -103,7 +103,17 @@ def marker_verdict(description: str | None) -> str | None:
     for marker in _NON_TENDER_MARKERS:
         if _fold(marker) in folded:
             return "not_biddable"
-    if _has_no_real_description(desc):
+    # wallonia_conseilcommunal never has a description at all - conseilcommunal.be
+    # structurally only publishes a title (see conseilcommunal_pipeline.py's
+    # `missing = ["description", "estimated_value"]  # this platform never
+    # publishes either`). An empty description there is normal, not the
+    # "Geef korte beschrijving op" placeholder / genuinely-blank signal this
+    # check exists for on the other two sources - short-circuiting to
+    # not_biddable here would silently classify all ~1,300+ of this source's
+    # rows without ever letting the LLM tier read the (often informative)
+    # title. Fall through to the LLM instead, same as any other source with
+    # real content.
+    if source != "wallonia_conseilcommunal" and _has_no_real_description(desc):
         return "not_biddable"
     return None
 
@@ -151,8 +161,15 @@ def _classify_with_llm(title: str, description: str) -> tuple[str, str]:
         raise RuntimeError(f"Anthropic API error {resp.status_code}: {resp.text[:300]}")
     payload = resp.json()
     text = "".join(block.get("text", "") for block in payload.get("content", []) if block.get("type") == "text")
+    # Despite the system prompt saying "no other text", Haiku consistently
+    # wraps the JSON in a markdown code fence (```json ... ```) - strip one
+    # off if present rather than failing to parse every single response.
+    stripped = text.strip()
+    fence_match = re.match(r"^```(?:json)?\s*\n(.*)\n```$", stripped, re.DOTALL)
+    if fence_match:
+        stripped = fence_match.group(1).strip()
     try:
-        parsed = json.loads(text.strip())
+        parsed = json.loads(stripped)
     except json.JSONDecodeError:
         # Never guess a classification from unparseable output — fail
         # loudly so it stays NULL and gets retried next run, same
@@ -230,7 +247,7 @@ def run() -> None:
 
     counts = {"marker/not_biddable": 0, "llm/open_call": 0, "llm/not_biddable": 0, "llm/unclear": 0, "llm/failed": 0}
     for i, row in enumerate(rows):
-        verdict = marker_verdict(row.get("description"))
+        verdict = marker_verdict(row.get("description"), row.get("source"))
         if verdict is not None:
             _update_bid_status(session, row["source"], row["source_reference"], verdict, "matched a known non-biddable marker", "marker")
             counts["marker/not_biddable"] += 1
